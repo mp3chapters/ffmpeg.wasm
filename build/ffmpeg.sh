@@ -10,6 +10,7 @@ CONF_FLAGS=(
   --enable-avformat
   --enable-avfilter
   --enable-libmp3lame
+  --enable-swresample
 
   --enable-demuxer=mp3
   --enable-demuxer=concat
