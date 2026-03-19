@@ -1,11 +1,15 @@
 # syntax=docker/dockerfile-upstream:master-labs
 
+# Global build arg — must be declared before the first FROM to be usable in FROM instructions.
+ARG FFMPEG_TARGET=mp3
+
 # Base emsdk image with environment variables.
 FROM emscripten/emsdk:3.1.40 AS emsdk-base
 ARG EXTRA_CFLAGS
 ARG EXTRA_LDFLAGS
 ARG FFMPEG_ST
 ARG FFMPEG_MT
+ARG FFMPEG_TARGET=mp3
 ENV INSTALL_DIR=/opt
 # We cannot upgrade to n6.0 as ffmpeg bin only supports multithread at the moment.
 ENV FFMPEG_VERSION=n5.1.4
@@ -17,15 +21,16 @@ ENV EM_TOOLCHAIN_FILE=$EMSDK/upstream/emscripten/cmake/Modules/Platform/Emscript
 ENV PKG_CONFIG_PATH=$PKG_CONFIG_PATH:$EM_PKG_CONFIG_PATH
 ENV FFMPEG_ST=$FFMPEG_ST
 ENV FFMPEG_MT=$FFMPEG_MT
+ENV FFMPEG_TARGET=$FFMPEG_TARGET
 RUN apt-get update && \
       apt-get install -y pkg-config autoconf automake libtool ragel
 
-# # Build x264
-# FROM emsdk-base AS x264-builder
-# ENV X264_BRANCH=4-cores
-# ADD https://github.com/ffmpegwasm/x264.git#$X264_BRANCH /src
-# COPY build/x264.sh /src/build.sh
-# RUN bash -x /src/build.sh
+# Build x264 (used by the video target)
+FROM emsdk-base AS x264-builder
+ENV X264_BRANCH=4-cores
+ADD https://github.com/ffmpegwasm/x264.git#$X264_BRANCH /src
+COPY build/x264.sh /src/build.sh
+RUN bash -x /src/build.sh
 
 # # Build x265
 # FROM emsdk-base AS x265-builder
@@ -41,7 +46,7 @@ RUN apt-get update && \
 # COPY build/libvpx.sh /src/build.sh
 # RUN bash -x /src/build.sh
 
-# Build lame
+# Build lame (only used for the mp3 target)
 FROM emsdk-base AS lame-builder
 ENV LAME_BRANCH=master
 ADD https://github.com/ffmpegwasm/lame.git#$LAME_BRANCH /src
@@ -78,12 +83,12 @@ RUN bash -x /src/build.sh
 # COPY build/vorbis.sh /src/build.sh
 # RUN bash -x /src/build.sh
 
-# # Build zlib
-# FROM emsdk-base AS zlib-builder
-# ENV ZLIB_BRANCH=v1.2.11
-# ADD https://github.com/ffmpegwasm/zlib.git#$ZLIB_BRANCH /src
-# COPY build/zlib.sh /src/build.sh
-# RUN bash -x /src/build.sh
+# Build zlib (needed by the video target for PNG decoding)
+FROM emsdk-base AS zlib-builder
+ENV ZLIB_BRANCH=v1.2.11
+ADD https://github.com/ffmpegwasm/zlib.git#$ZLIB_BRANCH /src
+COPY build/zlib.sh /src/build.sh
+RUN bash -x /src/build.sh
 
 # # Build libwebp
 # FROM emsdk-base AS libwebp-builder
@@ -132,14 +137,31 @@ RUN bash -x /src/build.sh
 # COPY build/zimg.sh /src/build.sh
 # RUN bash -x /src/build.sh
 
-# Base ffmpeg image with dependencies and source code populated.
-FROM emsdk-base AS ffmpeg-base
+# Dependency selector stages: choose external codec libraries based on FFMPEG_TARGET.
+# mp3 target requires libmp3lame; video target relies only on FFmpeg's built-in codecs.
+FROM emsdk-base AS deps-mp3
+COPY --from=lame-builder $INSTALL_DIR $INSTALL_DIR
+
+FROM emsdk-base AS deps-m4b
+# no external libs needed: mp3 decoder and aac encoder are both built into FFmpeg
+
+FROM emsdk-base AS deps-video
+# zlib: needed by FFmpeg's PNG decoder
+COPY --from=zlib-builder $INSTALL_DIR $INSTALL_DIR
+# x264: H.264 encoder
+COPY --from=x264-builder $INSTALL_DIR $INSTALL_DIR
+
+# Select the right deps stage based on FFMPEG_TARGET (ARG declared before first FROM, so
+# it is available here for use in the FROM instruction).
+FROM deps-${FFMPEG_TARGET} AS codec-deps
+
+# Base ffmpeg image: SDL2 + FFmpeg source on top of the selected codec deps.
+FROM codec-deps AS ffmpeg-base
 RUN embuilder build sdl2 sdl2-mt
 ADD https://github.com/FFmpeg/FFmpeg.git#$FFMPEG_VERSION /src
 # COPY --from=x264-builder $INSTALL_DIR $INSTALL_DIR
 # COPY --from=x265-builder $INSTALL_DIR $INSTALL_DIR
 # COPY --from=libvpx-builder $INSTALL_DIR $INSTALL_DIR
-COPY --from=lame-builder $INSTALL_DIR $INSTALL_DIR
 # COPY --from=opus-builder $INSTALL_DIR $INSTALL_DIR
 # COPY --from=theora-builder $INSTALL_DIR $INSTALL_DIR
 # COPY --from=vorbis-builder $INSTALL_DIR $INSTALL_DIR
@@ -151,11 +173,12 @@ COPY --from=lame-builder $INSTALL_DIR $INSTALL_DIR
 FROM ffmpeg-base AS ffmpeg-builder
 COPY build/ffmpeg.sh /src/build.sh
 RUN bash -x /src/build.sh \
-      --enable-gpl \
+      --enable-gpl
+      # Target-specific codec flags (--enable-libmp3lame etc.) are handled inside
+      # ffmpeg.sh based on $FFMPEG_TARGET, so only the GPL license flag is needed here.
       # --enable-libx264 \
       # --enable-libx265 \
       # --enable-libvpx \
-      --enable-libmp3lame
       # --enable-libtheora \
       # --enable-libvorbis \
       # --enable-libopus \
@@ -164,39 +187,18 @@ RUN bash -x /src/build.sh \
       # --enable-libfreetype \
       # --enable-libfribidi \
       # --enable-libass \
-      # --enable-libzimg 
+      # --enable-libzimg
 
 # Build ffmpeg.wasm
 FROM ffmpeg-builder AS ffmpeg-wasm-builder
 COPY src/bind /src/src/bind
 COPY src/fftools /src/src/fftools
 COPY build/ffmpeg-wasm.sh build.sh
-# libraries to link
-ENV FFMPEG_LIBS \
-      # -lx264 \
-      # -lx265 \
-      # -lvpx \
-      -lmp3lame
-      # -logg \
-      # -ltheora \
-      # -lvorbis \
-      # -lvorbisenc \
-      # -lvorbisfile \
-      # -lopus \
-      # -lz \
-      # -lwebpmux \
-      # -lwebp \
-      # -lsharpyuv \
-      # -lfreetype \
-      # -lfribidi \
-      # -lharfbuzz \
-      # -lass \
-      # -lzimg
+# External library linking and swscale (video target) are handled inside ffmpeg-wasm.sh
+# based on $FFMPEG_TARGET, so no FFMPEG_LIBS env var is needed here.
 RUN mkdir -p /src/dist/umd && bash -x /src/build.sh \
-      ${FFMPEG_LIBS} \
       -o dist/umd/ffmpeg-core.js
 RUN mkdir -p /src/dist/esm && bash -x /src/build.sh \
-      ${FFMPEG_LIBS} \
       -sEXPORT_ES6 \
       -o dist/esm/ffmpeg-core.js
 
